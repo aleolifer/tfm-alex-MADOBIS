@@ -1,0 +1,1013 @@
+---
+title: "TFM"
+author: "Alex Oliva Fernandez"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE)
+
+# Load necessary libraries
+library(dplyr)
+library(tidyverse)
+library(here)
+
+library(DESeq2)
+library(WGCNA)
+
+library(treemap)
+library(ggplot2)
+library(patchwork)
+
+# Set directory
+here::i_am("./tfmAlex.Rmd")
+
+# Allow use of multiple threads
+enableWGCNAThreads()
+```
+
+# PREPROCESS EXPERIMENTAL DATA
+
+Experimental data consists of a raw gene expression count table for
+43817 genes and metadata regarding time and organism's ploidy for each
+of the 71 samples. We focus only on 38 samples divided in 3 groups: 16
+diploids (labeled from now on as 2p), 6 neotetraploids (n4p) and 16
+tetraploids (4p).
+
+In this step we will load, format, filter and normalize relevant data.
+
+## Load and format experimental data as needed.
+
+```{r}
+# Clear workspace
+rm(list=ls())
+# Load RNA sequencing data and metadata
+rnaseq_data = read.table(file="data/experiment/raw_counts_diabro03.1_flowers_matrix.txt",
+                     header=T, row.names = 1, sep = " ") %>%
+  as.data.frame()
+rnaseq_metadata = read.table(file="data/experiment/DbroteriflowerRNAseq_metadata.txt",
+                       header = T, row.names = 1) %>%
+  as.data.frame()
+
+# Save data relevant to this study
+rnaseq_metadata = arrange(rnaseq_metadata, ploidy)
+sample_names = rownames(rnaseq_metadata[rnaseq_metadata$ploidy%in%c("2","4neo","4"),])
+gene_names = rownames(rnaseq_data)
+
+data = rnaseq_data[, sample_names]
+metadata = rnaseq_metadata[sample_names,]
+
+# Check rownames and column names are identical
+all(rownames(metadata) %in% colnames(data))
+all(rownames(metadata) == colnames(data))
+```
+
+## Quality Control: removing outliers and low counts genes.
+
+```{r}
+# Identify outliers
+gsg = goodSamplesGenes(t(data))
+gsg$allOK # outliers detected
+table(gsg$goodGenes) # 1961 outlier genes
+table(gsg$goodSamples) # no outlier samples
+
+# Remove genes detected as outliers
+data = data[gsg$goodGenes == TRUE,]
+
+# Create a deseq2 dataset
+dds = DESeqDataSetFromMatrix(countData=data,
+                              colData=metadata,
+                              design = ~ ploidy)
+
+# Remove low count genes:
+# Filter out all genes with counts < 15 in more than 75% of samples as suggested by WGCNA on RNAseq FAQ
+dds75 = dds[rowSums(counts(dds) >= 15) >= 10,] # 38*0.25=9.5 
+nrow(dds75) # 25785 genes left
+gene_expression_75 = assay(dds75)
+```
+
+## Normalization by variance stabilization.
+
+```{r}
+# Perform variance stabilizing transformation to normalize counts
+dds_norm = vst(dds75)
+# Get normalized counts
+normalized_gene_expression = assay(dds_norm)
+
+# Save the normalized gene expression count tables
+nge_2p = normalized_gene_expression[,1:16]
+write.table(nge_2p, file = "data/normalized_gene_expression_2p.txt") 
+nge_n4p = normalized_gene_expression[,33:38]
+write.table(nge_n4p, file = "data/normalized_gene_expression_n4p.txt") 
+nge_4p = normalized_gene_expression[,17:32]
+write.table(nge_4p, file = "data/normalized_gene_expression_4p.txt")
+
+# Save gene names to visualize data structure
+gene_names = rownames(normalized_gene_expression)
+preprocessed = rep(TRUE, length(gene_names)) %>% as.data.frame
+rownames(preprocessed) = gene_names
+colnames(preprocessed) = "preprocessed"
+gene_structure = data.frame(preprocessed)
+write.table(gene_structure, file = "data/module_structure_2p.txt")
+```
+
+# EXPERIMENTAL DATA ANALYSIS: MODULE DETECTION AND ALIGNMENT
+
+We establish diploids gene expression as reference data for all
+comparisons. We build its GCN and detect modules from said network using
+WGCNA. We will then work module by module.
+
+## Construct Gene Coexpression Network for diploids experimental group
+
+We load and format normalized gene expression data to build the 2p-GCN.
+The first step is to choose an appropriate soft-thresholding power,
+imposing a good fit to a free-scale model (R squared of at least 0.9)
+while retaining high enough connectivity (mean connectivity above 20).
+
+```{r}
+rm(list=ls())
+# Read and format gene expression data for diploids
+counts = read.table("data/normalized_gene_expression_2p.txt", header = TRUE)
+gene_names = rownames(counts)
+datExpr = t(counts) %>% as.data.frame
+
+# Call the network topology analysis function
+powers = c(1:9, seq(10,20,2))
+set.seed(17)
+sft = pickSoftThreshold(datExpr, powerVector = powers,
+                        blockSize = 10000, verbose = 1)
+save(powers, sft,
+     file = "figures/RData/sup1.RData")
+print("See: Supplementary Figure 1.")
+# Check program's choice
+sft$powerEstimate #12
+# Set threshold maximizing scale independence maintaining good connectivity: also 12
+power = 12
+sft$fitIndices[10,] # R^2=0.9470014	, mean connectivity = 50.08512
+```
+
+## Detect modules for the diploids experimental gene coexpression network
+
+We detect modules in our reference data set to extract highly correlated
+subnetworks in order to perform structure conservation analysis and
+simulations in each of them. Minimum module size is set to 200 to allow
+further analysis of these genes.
+
+```{r}
+# Clear workspace
+rm(list=setdiff(ls(),"datExpr"))
+# Perform automatic network construction and module detection in a single block
+bwModules = blockwiseModules(datExpr,
+                             power = 12,
+                             TOMType = "unsigned", 
+                             networkType = "unsigned",
+                             maxBlockSize = 30000,
+                             minModuleSize = 200, 
+                             reassignThreshold = 0.001,
+                             mergeCutHeight = 0.25,
+                             numericLabels = TRUE,
+                             pamRespectsDendro = FALSE,
+                             saveTOMs = TRUE,
+                             saveTOMFileBase = "RData/TOM_2p",
+                             randomSeed = 17)
+
+# Save results (the Topological Overlap Matrix has already been saved)
+save(datExpr, bwModules,
+     file = "RData/Modules_2p.RData")
+```
+
+Save module attributes:
+
+```{r}
+load("RData/Modules_2p.RData")
+gene_names = colnames(datExpr)
+moduleColors = labels2colors(bwModules$colors)
+eigengenes = bwModules$MEs
+geneTree = bwModules$dendrograms[[1]] # Hierarchical clustering
+module_sizes = table(moduleColors) %>% as.data.frame %>% arrange(Freq)
+module_names_ordered = as.character(module_sizes$moduleColors)
+
+# Save attributes as RData
+save(gene_names, moduleColors, eigengenes, geneTree, module_sizes, module_names_ordered,
+     file = "RData/Modules_2p_attributes.RData")
+# Save modules ranked
+write.table(module_names_ordered, row.names = FALSE, col.names = FALSE,
+            file = "data/module_names_ordered.txt")
+
+# Save module structure for plotting
+gene_str = read.table("data/module_structure_2p.txt", header = TRUE) %>%
+  mutate(module_detected = moduleColors)
+write.table(gene_str, file = "data/module_structure_2p.txt")
+```
+
+Save gene names in each module, which will be studied as separate
+subnetworks. Modules will be ordered by increasing size and named
+accordingly.
+
+```{r}
+l = length(module_names_ordered)
+for(m in 1:l){
+  color = module_names_ordered[m]
+  filename = paste("data/module_gene_names/module", m, "_", color, ".txt", sep="")
+  genes = gene_names[which(moduleColors==color)]
+  write.table(genes, file = filename,
+              row.names = F, col.names = F, sep="\t",
+              quote = F)
+}
+```
+
+## Measure module structure conservation in experimental data
+
+We will study separately for each module in diploids GCN how well its
+structure is preserved comparing both tetraploid groups to diploids.
+Module conservation statistics are obtained for the submodules in each module. 
+
+### Function to detect submodules in each module:
+
+```{r}
+modules_given_datExpr = function(datExpr, power = 12){
+  blocksize = ncol(datExpr) + 1
+  modules = blockwiseModules(datExpr,
+                             power = 12, #as in the original nw
+                             TOMType = "unsigned",
+                             networkType = "unsigned",
+                             maxBlockSize = blocksize, # for a single block
+                             reassignThreshold = 0.001,
+                             mergeCutHeight = 0.05,
+                             numericLabels = TRUE,
+                             pamRespectsDendro = FALSE,
+                             randomSeed = 17)
+}
+```
+
+### Obtain Zsummaries for every submodule
+
+Sequentially, we will select genes from the module chosen and study
+experimental data from them. We will obtain statistics about structure
+preservation comparing 4p-2p and n4p-2p gene correlation patterns in
+each module.
+
+Loop steps:
+
+STEP 1.- Load, format and filter gene expression data
+STEP 2.- Detect submodules and save relevant information
+STEP 3.- Compute module preservation statistics
+
+Results will be saved in a data frame containing Zsummaries for each
+comparison and information about the module and experimental group
+involved, as well as module sizes.
+
+```{r}
+# auxiliary variables
+values = c(); module = c(); comp = c(); sm_size = c(); m_size = c()
+l = length(module_names_ordered)
+
+for(m in 1:l){
+  ### STEP 1.- Load, format and filter gene expression data
+  # Select genes in m-th module
+  color = module_names_ordered[m]
+  filename = paste("data/module_gene_names/module", m, "_", color, ".txt",
+                   sep="")
+  gene_names = read.table(filename)[[1]]
+  nw_size = length(gene_names)
+  
+  # Load the normalized count tables for the selected genes 
+  # in the 3 experimental groups (diploids=2p, tetraploids=4p, neotetraploids=n4p)
+  datExpr_2p = read.table("data/normalized_gene_expression_2p.txt", header = TRUE)
+  datExpr_2p = datExpr_2p[gene_names,] %>% t %>% as.data.frame
+  
+  datExpr_4p = read.table("data/normalized_gene_expression_4p.txt", header = TRUE)
+  datExpr_4p = datExpr_4p[gene_names,] %>% t %>% as.data.frame
+  
+  datExpr_n4p = read.table("data/normalized_gene_expression_n4p.txt", header = TRUE)
+  datExpr_n4p = datExpr_n4p[gene_names,] %>% t %>% as.data.frame
+  
+  # Format to list
+  list_of_datExpr = list(datExpr_2p, datExpr_4p, datExpr_n4p)
+  group = c("Diploids", "Tetraploids", "Neotetraploids")
+  
+  # Check if every gene and sample is appropiate for further calculations
+  multiExpr = list2multiData(list_of_datExpr)
+  good = goodSamplesGenesMS(multiExpr)
+  if(!good$allOK){ 
+    bad_genes = gene_names[!good$goodGenes]
+    gene_names = gene_names[good$goodGenes]
+    nw_size = length(gene_names)
+    
+    good_samples = good$goodSamples[[1]]
+    datExpr_2p = datExpr_2p[good_samples,gene_names]
+    good_samples = good$goodSamples[[2]]
+    datExpr_4p = datExpr_4p[good_samples,gene_names]
+    good_samples = good$goodSamples[[3]]
+    datExpr_n4p = datExpr_n4p[good_samples,gene_names]
+    
+    list_of_datExpr = list(datExpr_2p, datExpr_4p, datExpr_n4p)
+    multiExpr = list2multiData(list_of_datExpr)
+  }
+  
+  ### STEP 2.- Detect submodules and save relevant information
+  
+  modules_list = list()
+  colors_list = list()
+  dendrograms_list = list()
+  TOM_list = list()
+  connectivities_list = list()
+  
+  for(i in 1:3){
+    datExpr = list_of_datExpr[[i]]
+    #detect modules
+    modules = modules_given_datExpr(datExpr)
+    modules_list[[i]] = modules
+    # modules for each gene
+    colors_list[[i]] = modules$colors %>% labels2colors
+    # dendrograms for the clustering
+    dendrograms_list[[i]] = modules$dendrograms[[1]]
+    # Recalculate TOM
+    TOM = TOMsimilarityFromExpr(datExpr, power = 12, TOMType = "unsigned")
+    colnames(TOM) = gene_names; rownames(TOM) = gene_names
+    TOM_list[[i]] = TOM
+    # connectivity for each gene
+    con = (rowSums(TOM)-1)
+    connectivities_list[[i]] = con
+  }
+  
+  filename = paste("RData/modules_exp/module", m, "_", color, ".RData", sep="")
+  save(list_of_datExpr, group,
+       modules_list, colors_list,
+       dendrograms_list, TOM_list, connectivities_list,
+       file=filename)
+  
+  ### STEP 3.- Compute module preservation statistics
+  comp_group = factor(group[-1])
+  multiExpr = list2multiData(list_of_datExpr)
+  names(multiExpr) = group
+  names(colors_list) = group
+  
+  # Use modulePreservation function
+  stats = modulePreservation(multiData = multiExpr, multiColor = colors_list,
+                              dataIsExpr = TRUE, multiWeights = NULL,
+                              networkType = "unsigned",
+                              referenceNetworks = c(1),
+                              testNetworks = 2:3,
+                              randomSeed = 17, maxModuleSize = nw_size,
+                              parallelCalculation = TRUE, verbose = 2)
+  # Save data
+  filename = paste("RData/modules_exp/module", m, "_", color, "_stats.RData", sep="")
+  save(stats,
+       file=filename)
+  # variables to construct Zsummaries from each comparison
+  list_refs = stats$preservation$Z$ref.Diploids
+  x = list_refs[[2]]["Zsummary.pres"][[1]] #Zsummaries 4p-2p
+  y = list_refs[[3]]["Zsummary.pres"][[1]] #Zsummaries n4p-2p
+  nm = length(x)
+  values = c(values, c(x, y))
+  module = c(module, rep(color, 2*nm))
+  comp = c(comp, rep(c("4p","n4p"), nm))
+}
+
+# Zsummaries data frame
+ZsDf = data.frame(Zsum=values, module=module, comp=comp)
+save(ZsDf,
+     file ="RData/exp_data_Zsummaries.RData")
+
+# Save module and submodule structure:
+gene_str = read.table("data/module_structure_2p.txt", header = TRUE) %>%
+  mutate(compared = FALSE, submodule_detected = "gray")
+module_names_ordered = read.table(file="data/module_names_ordered.txt", sep = "\n")[,1]
+l = length(module_names_ordered)
+for(m in 1:l){
+  color = module_names_ordered[m]
+  filename = paste("RData/modules_exp/module", m, "_", color, ".RData", sep="")
+  load(filename)
+  usedforZsum = colnames(list_of_datExpr[[1]])
+  gene_str[usedforZsum,3] = rep(TRUE, length(usedforZsum))
+  submodules = colors_list[[1]]
+  gene_str[usedforZsum,4] = submodules
+}
+write.table(gene_str, file = "data/module_structure_2p.txt")
+```
+
+## Results
+
+### Diploids GCN structure
+Visualize 2p-GCN modules and submodules, cluster dendrogram and module size distribution.
+
+```{r}
+print("See: Figure 1.")
+print("See: Supplementary Table 2.")
+```
+
+### Zsummary tables
+
+Zsummaries calculated and module info, module scores in each module and comparison (Table 1), number of modules conserved in tetraploids (Table 2).
+
+```{r}
+rm(list=ls())
+gene_str = read.table("data/module_structure_2p.txt", header = TRUE)
+module_sizes = gene_str %>% group_by(module_detected) %>%
+  summarise(module_size = n()) %>%
+  mutate(module = module_detected, .keep = "unused")
+load("RData/exp_data_Zsummaries.RData")
+
+ZsDf = left_join(ZsDf, module_sizes)
+ZsDf = arrange(ZsDf, module_size)
+
+ZsMd <- ZsDf %>% group_by(module, comp) %>% 
+  summarise(score = median(Zsum, na.rm = TRUE), .groups = "keep") %>%
+  mutate(conserved = (score >=2))
+ZsMd = left_join(ZsMd, module_sizes)
+ZsMd = ZsMd %>% ungroup %>% mutate(score = round(score, 4))
+ZsMd = arrange(ZsMd, module_size)
+write.table(ZsMd, file = "data/exp_MedianZsummariesDataframe.txt")
+
+ZsCases = ZsMd %>% filter(conserved) %>% group_by(module) %>%
+  summarise(Case = ifelse(("4p" %in% comp),
+                          ifelse("n4p" %in% comp, "A", "B"), "C"))
+caseD = unique(ZsDf$module)
+caseD = caseD[! caseD %in% ZsCases$module] #No  module conserved
+ZsCases = ZsCases %>% add_row(module = caseD, Case = "D")
+
+ZsDf = left_join(ZsDf, ZsCases, by = "module")
+ZsDf = arrange(ZsDf, module_size) %>%
+  mutate(Zsummaries = round(Zsum,5), .keep = "unused", .after = "module")
+write.table(ZsDf, file = "data/exp_ZsummariesDataframe.txt")
+
+CasesTable = summarise(ZsCases, modules = n(), .by = "Case")
+write.table(CasesTable, file = "data/exp_ConservationCases.txt")
+```
+
+### Zsummaries boxplots
+```{r}
+print("See: Supplementary Figure 2")
+print("See: Figure 1")
+```
+### Discarding linear dependency of module size in Zsummary scores
+```{r}
+ZsDf = read.table("data/exp_ZsummariesDataframe.txt")
+df = ZsDf[!is.na(ZsDf$Zsummaries),]
+c1 = cor(df$Zsummaries, df$module_size)
+r1 = paste("cor =",round(c1,5))
+df_sub = subset(df, module_size < 1200)
+c2 =cor(df_sub$Zsummaries, df_sub$module_size)
+r2 = paste("cor =",round(c2,5))
+model = lm(Zsummaries ~ module_size, data = df)
+summary(model)
+model2 = lm(Zsummaries ~ module_size, data = df_sub)
+summary(model2)
+
+print(paste("Correlation =", c1))
+print(paste("Discarding the top 6 modules, correlation =", c2))
+print("See: Supplementary Figure 4")
+```
+### Visualize module structure comparisons looking at dendrograms
+```{r}
+print("See: Supplementary Figure 4")
+```
+### Differential module preservation: McNemar tests
+We use McNemar test to evaluate if the amount of 2p-modules preserved in 4p is significantly higher than in n4p.
+
+```{r}
+ZsMd = read.table("data/exp_MedianZsummariesDataframe.txt")
+# Mean and median summaries over all modules
+tb <- ZsMd %>% ungroup %>% group_by(comp) %>%
+  summarize(medianZ = median(score),
+            meanZ = mean(score)) %>%
+  column_to_rownames("comp")
+round(tb,3)
+print("See: Supplementary Table 3")
+
+# Test p-value, using median Zsummary >2 as conservation threshold
+tb = matrix(c(6, 1, 7, 28), 2, 2, byrow=TRUE,
+dimnames=list(conserved_4p=c("Yes", "No"), conserved_n4p=c("Yes", "No")))
+tb
+b = tb[1,2]; c = tb[2,1]
+
+print("p-value:")
+p_value1 = pbinom(c-1, size=b+c, prob = 0.5)
+p_value1 = 1-pbinom(c-1, size=b+c, prob = 0.5)
+p_value1
+print("There are evidences of higher module conservation in natural tetraploids at significance level 0.05.")
+```
+# SIMULATED DATA GENERATION AND ANALYSIS
+## Generate simulated data
+```{r}
+# Clear workspace
+rm(list=ls())
+numsim = 5 # change after selecting noise
+# Noise factor selection from
+noises = c(0.1, 0.5, 1, 2)
+```
+### Function "wgd":
+Duplicates gene expression introducing noise and imbalances to model whole genome duplication.
+```{r}
+wgd <- function(datExpr, noise = 1,
+                unbalanced = list()){
+  genes <- rownames(datExpr)
+  datExpr_m <- as.matrix(datExpr)
+  datExpr2 <- as.matrix(datExpr)
+  for(i in 1:nrow(datExpr)){
+    if(genes[i] %in% unbalanced){
+      datExpr2[i,] <- jitter(datExpr_m[i,], factor = noise, amount = 0)
+    }
+    else{
+      datExpr2[i,] <- jitter(2*datExpr_m[i,], factor = noise, amount = 0)
+    }
+  }
+  datExpr2 <- as.data.frame(datExpr2)
+  return(datExpr2)
+}
+```
+### Simulate gene expression data
+```{r}
+print("Simulating gene expression tables suffering WGD")
+noises = c(0.5, 1, 5, 10)
+for(n in 1:4){
+  noise = noises[n] 
+  
+  module_names_ordered = read.table(file="data/module_names_ordered.txt", sep = "\n")[,1]
+  l=length(module_names_ordered)
+  for(m in 1:l){
+    
+    # Load module information from experimental analysis
+    color = module_names_ordered[m]
+    filename = paste("RData/modules_exp/module", m, "_", color, ".RData", sep="")
+    load(filename)
+    print(paste("Working on module", m, ":", color))
+    datExpr = list_of_datExpr[[1]]
+    gene_names = colnames(datExpr)
+    nw_size = length(gene_names)
+    
+    # Select hubs in 2p-GCN module: highest intramodular connectivity: 20%
+    con = connectivities_list[[1]] 
+    Q = quantile(con, 0.8, na.rm = TRUE, names = FALSE)
+    hubs = gene_names[con >= Q]
+    
+    # Number of unbalanced genes in non-control simulations
+    unb = floor(length(hubs)/2) #10% of data
+    
+    # Simulations list
+    for(i in 1:(3*numsim)){ #initializing list
+      list_of_datExpr[[i+3]] = datExpr*0
+    }
+    for(i in 1:numsim){
+      sim_c <- wgd(datExpr, noise)
+      list_of_datExpr[[3+i]] <- sim_c %>% as.data.frame
+      sim_a <- wgd(datExpr, noise, unbalanced = sample(gene_names, unb))
+      list_of_datExpr[[3+numsim+i]] <- sim_a %>% as.data.frame
+      sim_h <- wgd(datExpr, noise, unbalanced = sample(hubs, unb))
+      list_of_datExpr[[3+2*numsim+i]] <- sim_h %>% as.data.frame
+    }
+    
+    # Save simulated gene expression tables
+    group = c("Diploids", "Tetraploids", "Neotetraploids",
+              rep("c",numsim),
+              rep("a",numsim),
+              rep("h",numsim))
+    subgroup = c("Diploids", "Tetraploids", "Neotetraploids",
+                 paste("c",1:numsim, sep=""),
+                 paste("a",1:numsim, sep=""),
+                 paste("h",1:numsim, sep=""))
+    
+    filename = paste("RData/sim_datExpr/",
+                     n, "_", #delete after selcting noise
+                     "module", m, "_", color, ".RData", sep="")
+    save(list_of_datExpr, numsim, group, subgroup,
+         file= filename)
+  }
+}
+print("Simulated gene expression data generated")
+rm(list=setdiff(ls(), c("noise", "numsim")))
+```
+### Function to detect submodules (as above)
+```{r}
+modules_given_datExpr = function(datExpr){
+  blocksize = ncol(datExpr) + 1
+  modules = blockwiseModules(datExpr,
+                             power = 12, #as in the original nw
+                             TOMType = "unsigned",
+                             networkType = "unsigned",
+                             maxBlockSize = blocksize, # for a single block
+                             reassignThreshold = 0.001,
+                             mergeCutHeight = 0.05,
+                             numericLabels = TRUE,
+                             pamRespectsDendro = FALSE,
+                             randomSeed = 17)
+}
+```
+### Measure module structure conservation in simulated data
+```{r}
+print("\n Module structure analysis: detecting submodules")
+noises = c(0.1, 0.5, 1, 2)
+for(n in 1:4){
+  module_names_ordered = read.table(file="data/module_names_ordered.txt", sep = "\n")[,1]
+  l = length(module_names_ordered)
+  for(m in 1:l){
+    ### STEP 1.- Load experimental module information and all gene expression data
+    
+    # Select genes in m-th module used in experimental data analysis
+    # we descard genes unused earlier to be able to compare results
+    color = module_names_ordered[m]
+    filename = paste("RData/modules_exp/module", m, "_", color,".RData", sep="")
+    load(filename)
+    filename = paste("RData/sim_datExpr/",
+                     n, "_", #delete after selcting noise
+                     "module", m, "_", color, ".RData", sep="")
+    load(filename) #only list_of_datExpr gets overwritten, as we wish
+    print(paste("Working on module", m, ":", color))
+    datExpr = list_of_datExpr[[1]]
+    gene_names = colnames(datExpr)
+    nw_size = length(gene_names)
+    
+    ### STEP 2.- Detect submodules in simulated GCN and save relevant information
+    for(i in 4:(3+3*numsim)){
+      datExpr = list_of_datExpr[[i]]
+      #detect modules
+      modules = modules_given_datExpr(datExpr)
+      modules_list[[i]] = modules
+      # modules for each gene
+      colors_list[[i]] = modules$colors %>% labels2colors
+      # dendrograms for the clustering
+      dendrograms_list[[i]] = modules$dendrograms[[1]]
+      # Recalculate TOM
+      TOM = TOMsimilarityFromExpr(datExpr, power = 12, TOMType = "unsigned")
+      colnames(TOM) = gene_names; rownames(TOM) = gene_names
+      TOM_list[[i]] = TOM
+      # connectivity for each gene
+      con = (rowSums(TOM)-1)
+      connectivities_list[[i]] = con
+      
+      print(paste("Submodules detected in simulation ", i-3, "/",3*numsim,sep=""))
+    }
+    
+    filename = paste("RData/modules_sim/",
+                     n, "_",#delete after selcting noise,
+                     "module", m, "_", color, ".RData", sep="")
+    save(list_of_datExpr, numsim, group, subgroup, 
+         modules_list, colors_list,
+         dendrograms_list, TOM_list, connectivities_list,
+         file=filename)
+    
+    print(paste("Module info saved for module",m,"and noise factor", noises[n]))
+  }
+  print(paste("Module info saved for all modules for noise factor", noises[n]))
+}
+print("All module structure information was saved")
+
+rm(list=setdiff(ls(), c("noise")))
+
+print("\n Analysing module structure preservation")
+noises = c(0.1, 0.5, 1, 2)
+for(n in 1:4){
+  # auxiliary variables
+  values = c(); module = c(); comp = c(); comp_group = c()
+  
+  module_names_ordered = read.table(file="data/module_names_ordered.txt", sep = "\n")[,1]
+  l = length(module_names_ordered)
+  for(m in 1:l){
+    # Load module information
+    color = module_names_ordered[m]
+    filename = paste("RData/modules_sim/",
+                     n, "_",#delete after selcting noise,
+                     "module", m, "_", color, ".RData", sep="")
+    load(filename)
+    print(paste("Working on module", m, ":", color))
+    datExpr = list_of_datExpr[[1]]
+    gene_names = colnames(datExpr)
+    nw_size = length(gene_names)
+    
+    ### STEP 3.- Compute module preservation statistics
+    multiExpr = list2multiData(list_of_datExpr)
+    names(multiExpr) = group
+    names(colors_list) = group
+    
+    print(paste("Computing module preservation statistics for module",m,
+                "and noise factor", noises[n]))
+    # Use modulePreservation function
+    stats = modulePreservation(multiData = multiExpr, multiColor = colors_list,
+                               dataIsExpr = TRUE, multiWeights = NULL,
+                               networkType = "unsigned",
+                               referenceNetworks = c(1),
+                               testNetworks = 4:(3+3*numsim),
+                               randomSeed = 17, maxModuleSize = nw_size,
+                               parallelCalculation = TRUE, verbose = 0)
+    # Save data
+    filename = paste("RData/modules_sim/",
+                     n, "_",#delete after selcting noise,
+                     "module", m, "_", color, "_stats.RData", sep="")
+    save(stats,
+         file=filename)
+    print(paste("Stats saved for module",m,"and noise factor", noises[n]))
+    # variables to construct Zsummaries from each comparison
+    list_refs = stats$preservation$Z$ref.Diploids
+    
+    x = list_refs[[4]]["Zsummary.pres"][[1]] #Zsummaries for this simulation
+    nm = length(x) #number of submodules for which a Zsummary is calculated
+    for(i in 4:(3+3*numsim)){
+      values = c(values, list_refs[[i]]["Zsummary.pres"][[1]])
+    }
+    module = c(module, rep(color, 3*numsim*nm))
+    comp = c(comp, rep(subgroup[4:(3+3*numsim)], each=nm))
+    comp_group = c(comp_group, rep(group[4:(3+3*numsim)], each=nm))
+  }
+  
+  # Zsummaries data frame
+  ZsDf = data.frame(Zsum=values, module=module, comp=comp, comp_group=comp_group)
+  save(ZsDf,
+       file = paste("RData/",
+                    n, "_",
+                    "sim_data_Zsummaries.RData", sep=""))
+  print(paste("Zsummaries saved for noise factor", noises[n]))
+}
+rm(list=ls())
+```
+## Results
+### Zsummary tables
+```{r}
+## Unify Zsummary data frame for all noise factors
+noises = c(0.1, 0.5, 1, 2) #select one: change _n afterwards
+n=1
+noise = noises[n]
+load(paste("RData/",
+           n, "_",
+           "sim_data_Zsummaries.RData", sep=""))
+data = ZsDf %>% mutate(noise = noise)
+for(n in 2:4){
+  noise = noises[n] 
+  load(paste("RData/",
+             n, "_",
+             "sim_data_Zsummaries.RData", sep=""))
+  ZsDf = ZsDf %>% mutate(noise = noise)
+  data = bind_rows(data, ZsDf)
+}
+ZsDf=data
+
+# Process module conservation information
+modules_studied = unique(ZsDf$module)
+gene_str = read.table("data/module_structure_2p.txt", header = TRUE) %>%
+  filter(module_detected %in% modules_studied)
+module_sizes = gene_str %>% group_by(module_detected) %>%
+  summarise(module_size = n()) %>%
+  mutate(module = module_detected, .keep = "unused")
+
+ZsDf = left_join(ZsDf, module_sizes) %>% arrange(module_size)
+
+ZsMd = ZsDf %>% group_by(module, comp, comp_group, noise) %>% summarize (score = median(Zsum)) %>%
+  mutate(conserved = (score >=10)) %>%
+  mutate(score = round(score, 4)) %>%
+  left_join(module_sizes) %>% arrange(module_size)
+write.table(ZsMd, file = "data/sim_MedianZsummariesDataframe.txt")
+
+ZsCases = ZsMd %>% group_by(noise, comp_group, module) %>%
+  summarise(cons = sum(conserved), .groups = "drop_last") %>%
+  summarise(conserved = sum(cons, na.rm = T))
+write.table(ZsCases, file = "data/sim_Conservation.txt")
+ZsDf = arrange(ZsDf, module_size) %>%
+  mutate(Zsummaries = round(Zsum,5), .keep = "unused", .after = "module")
+write.table(ZsDf, file = "data/sim_ZsummariesDataframe.txt")
+
+medianscores = ZsMd %>% group_by(module, comp_group) %>%
+  summarize(median = median(score))
+a_m = filter(medianscores, comp_group == "a") %>% mutate(comp_group = NULL)
+c_m = filter(medianscores, comp_group == "c") %>% mutate(comp_group = NULL)
+h_m = filter(medianscores, comp_group == "h") %>% mutate(comp_group = NULL)
+medianscores = left_join(a_m, c_m, join_by("module")) 
+medianscores = left_join(medianscores, h_m, join_by("module")) %>%
+  column_to_rownames("module") %>% `colnames<-`(c("a", "h", "c"))
+
+save(ZsDf, ZsMd, file="RData/sim_data_Zsummaries.RData")
+print("Module preservation statistics summarized.")
+```
+### Visualize module preservation scores
+```{r}
+print("See: Supplementary Figure 4")
+print("See: Figure 3")
+```
+
+### Tests:
+Prepare data for testing:
+```{r}
+rm(list=ls())
+noises=c(0.1,0.5,1,2)
+load("RData/sim_data_Zsummaries.RData")
+conservationCases = ZsMd %>%
+  group_by(type=comp_group) %>%
+  summarise(well_cons = sum(conserved), not_cons =sum(!conserved))
+conservationCases
+
+testZsMd = ZsMd %>% ungroup %>%
+  select(module, type = comp_group, score, noise)  %>%
+  mutate(balanced = (type == "c"), .after = "type")
+testZsMd = testZsMd %>% filter(!is.na(score))
+testZsMd$noise = as.factor(testZsMd$noise)
+testZsMd$type = as.factor(testZsMd$type)
+testZsMd$balanced = as.factor(testZsMd$balanced)
+testZsMd_data = testZsMd
+```
+#### Noise factor effect:
+Simulation scores are very different depending on the noise factor.
+```{r}
+  kw_test = kruskal.test(x=testZsMd$score, g=testZsMd$noise)
+  pvalue_noise_all = kw_test$p.value
+  pvalue_noise_all < 0.001
+```
+
+Testing effects on each module:
+```{r}
+tzm=testZsMd_data
+module_names_ordered = read.table(file="data/module_names_ordered.txt", sep = "\n")[,1]
+l = length(module_names_ordered)
+pvalue = c(pvalue_noise_all, rep(NA, l))
+for(m in 1:l){
+  color = module_names_ordered[m]
+  testZsMd = tzm %>% filter(module==color)
+  kw_test = kruskal.test(x=testZsMd$score, g=testZsMd$noise)
+  pvalue[m+1] = kw_test$p.value
+}
+pvalues_noise = data.frame(module = c("ALL",module_names_ordered), pvalue)
+
+pvalues_noise
+```
+#### Simulation type effect:
+```{r}
+pvalues_type=cbind(rep(NA,4),rep(NA,4),rep(NA,4)) %>%
+  `colnames<-`(c("Type", "Imbalance", "ImbalanceType")) %>%
+  `rownames<-`(noises)
+tzm = testZsMd_data
+for(n in 1:4){
+  testZsMd = tzm %>% filter(noise == noises[n])
+  # difference between the three types
+  kw_test = kruskal.test(x=testZsMd$score, g=testZsMd$type)
+  pvalues_type[n,1] = kw_test$p.value
+  # difference between balanced or unbalanced simulations
+  kw_test = wilcox.test(formula = score~balanced, data = testZsMd)
+  pvalues_type[n,2] = kw_test$p.value
+  # difference between the targeted/untargeted umbalanced simulations
+  kw_test = wilcox.test(formula = score~type, data = filter(testZsMd, balanced==F))
+  pvalues_type[n,3] = kw_test$p.value
+}
+tb = round(pvalues_type,5)
+tb
+```
+No significative differences were found across modules between simulation types.
+
+We repeat this analysis on each module:
+```{r}
+tzm=testZsMd_data
+dif_modules = matrix(nrow = 4,ncol=6) %>%
+  `colnames<-`(c("alpha_t<0.1", "alpha_t<0.05",
+                 "alpha_i<0.1", "alpha_i<0.05",
+                 "alpha_it<0.1", "alpha_it<0.05")) %>%
+  `rownames<-`(noises)
+module_names_ordered = read.table(file="data/module_names_ordered.txt", sep = "\n")[,1]
+l = length(module_names_ordered)
+pvalues_module=cbind(rep(NA,l),rep(NA,l),rep(NA,l)) %>%
+  `colnames<-`(c("Type", "Imbalance", "ImbalanceType")) %>%
+  `rownames<-`(module_names_ordered)
+for(n in 1:4){
+  tzm = testZsMd_data %>% filter(noise == noises[n])
+  for(m in 1:l){
+  color = module_names_ordered[m]
+  testZsMd = tzm %>% filter(module==color)
+  kw_test = kruskal.test(x=testZsMd$score, g=testZsMd$type)
+  pvalues_module[m,1] = kw_test$p.value
+  kw_test = wilcox.test(formula = score~balanced, data = testZsMd)
+  pvalues_module[m,2] = kw_test$p.value
+  kw_test = wilcox.test(formula = score~type, data = filter(testZsMd, balanced==F))
+  pvalues_module[m,3] = kw_test$p.value
+  }
+  dif_modules[n,1] = sum(pvalues_module[,1] < 0.1)
+  dif_modules[n,2] = sum(pvalues_module[,1] < 0.05)
+  dif_modules[n,3] = sum(pvalues_module[,2] < 0.1)
+  dif_modules[n,4] = sum(pvalues_module[,2] < 0.05)
+  dif_modules[n,5] = sum(pvalues_module[,3] < 0.1)
+  dif_modules[n,6] = sum(pvalues_module[,3] < 0.05)
+}
+dif_modules
+```
+Most modules showed no significant differences between different simulation types.
+
+We saved together these results from statistical inference of the effects of simulation type on module conservation scores. 
+```{r}
+suptable = dif_modules %>% as.data.frame %>%
+  mutate(Type=round(pvalues_type[,"Type"],5),
+         Imbalance=round(pvalues_type[,"Imbalance"],5),
+         ImbalanceType=round(pvalues_type[,"ImbalanceType"],5))
+suptable[,1:9] = suptable[,c(7,1,2,8,3,4,9,5,6)]
+suptable = suptable %>% `colnames<-`(colnames(suptable[,c(7,1,2,8,3,4,9,5,6)]))
+suptable
+```
+
+Focusing on the results for noise=0.5. Modules for which differences between simulation types.
+```{r}
+tzm=testZsMd_data %>% filter(noise == 0.5)
+dif_modules = c()
+module_names_ordered = read.table(file="data/module_names_ordered.txt", sep = "\n")[,1]
+l = length(module_names_ordered)
+pvalues_module=cbind(rep(NA,l),rep(NA,l),rep(NA,l)) %>%
+  `colnames<-`(c("Type", "Imbalance", "ImbalanceType")) %>%
+  `rownames<-`(module_names_ordered)
+for(m in 1:l){
+  color = module_names_ordered[m]
+  testZsMd = tzm %>% filter(module==color)
+  kw_test = kruskal.test(x=testZsMd$score, g=testZsMd$type)
+  pvalues_module[m,1] = kw_test$p.value
+  kw_test = wilcox.test(formula = score~balanced, data = testZsMd)
+  pvalues_module[m,2] = kw_test$p.value
+  kw_test = wilcox.test(formula = score~type, data = filter(testZsMd, balanced==F))
+  pvalues_module[m,3] = kw_test$p.value
+}
+pvalues_module
+dif_cons = pvalues_module %>% as.data.frame %>%
+  filter(Type<0.1)
+
+print("Differences on modules:")
+dif_cons
+```
+
+
+## Optimized wgd function 
+
+### Modified function "wgd":
+Duplicates gene expression introducing noise and imbalances to model whole genome duplication.
+```{r}
+wgd2 <- function(datExpr, noise = 0.5,
+                unbalanced = list()){
+  genes <- rownames(datExpr)
+  datExpr_m <- as.matrix(datExpr)
+  datExpr2 <- as.matrix(datExpr)
+  for(i in 1:nrow(datExpr)){
+    if(genes[i] %in% unbalanced){
+      unb_samples = sample(c(T,F), size=16,
+                           replace = T, prob = c(0.75,0.25))
+      datExpr2[i,unb_samples] <- jitter(datExpr_m[i,], factor = noise, amount = 0)
+      datExpr2[i,!unb_samples] <- jitter(2*datExpr_m[i,], factor = noise, amount = 0)
+    }
+    else{
+      datExpr2[i,] <- jitter(2*datExpr_m[i,], factor = noise, amount = 0)
+    }
+  }
+  datExpr2 <- as.data.frame(datExpr2)
+  return(datExpr2)
+}
+```
+### Modified implementation of "wgd" to simulate gene expression data
+```{r}
+# Clear workspace
+rm(list=ls())
+numsim = 10
+noise = 0.5
+print("Simulating gene expression tables suffering WGD")
+module_names_ordered = read.table(file="data/module_names_ordered.txt", sep = "\n")[,1]
+l=length(module_names_ordered)
+for(m in 1:l){
+    # Load module information from experimental analysis
+    color = module_names_ordered[m]
+    filename = paste("RData/modules_exp/module", m, "_", color, ".RData", sep="")
+    load(filename)
+    print(paste("Working on module", m, ":", color))
+    datExpr = list_of_datExpr[[1]]
+    gene_names = colnames(datExpr)
+    nw_size = length(gene_names)
+    
+    # Select hubs in 2p-GCN module: highest intramodular connectivity: 30%
+    con = connectivities_list[[1]] 
+    Q = quantile(con, 0.7, na.rm = TRUE, names = FALSE)
+    hubs = gene_names[con >= Q]
+    
+    # Number of unbalanced genes in non-control simulations
+    unb = floor(length(hubs)/2) #15% of data
+    
+    # Simulations list
+    for(i in 1:(3*numsim)){ #initializing list
+      list_of_datExpr[[i+3]] = datExpr*0
+    }
+    for(i in 1:numsim){
+      sim_c <- wgd2(datExpr, noise)
+      list_of_datExpr[[3+i]] <- sim_c %>% as.data.frame
+      sim_a <- wgd2(datExpr, noise, unbalanced = sample(gene_names, unb))
+      list_of_datExpr[[3+numsim+i]] <- sim_a %>% as.data.frame
+      sim_h <- wgd2(datExpr, noise, unbalanced = sample(hubs, unb))
+      list_of_datExpr[[3+2*numsim+i]] <- sim_h %>% as.data.frame
+    }
+    
+    # Save simulated gene expression tables
+    group = c("Diploids", "Tetraploids", "Neotetraploids",
+              rep("c",numsim),
+              rep("a",numsim),
+              rep("h",numsim))
+    subgroup = c("Diploids", "Tetraploids", "Neotetraploids",
+                 paste("c",1:numsim, sep=""),
+                 paste("a",1:numsim, sep=""),
+                 paste("h",1:numsim, sep=""))
+    
+    filename = paste("RData/sim_datExpr/module", m, "_", color, ".RData", sep="")
+    save(list_of_datExpr, numsim, group, subgroup,
+         file= filename)
+}
+print("Simulated gene expression data generated according to the adjusted model")
+rm(list=setdiff(ls(), c("noise", "numsim")))
+```
