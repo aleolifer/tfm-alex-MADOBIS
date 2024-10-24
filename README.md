@@ -1,6 +1,7 @@
 # tfm-alex-MADOBIS
 
-Code used for analyses
+Code used for analyses available in tfmAlex.Rmd
+
 
 All folders needed to run the code are uploaded. Their contents are classified in the following way:
 
